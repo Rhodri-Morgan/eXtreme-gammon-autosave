@@ -28,7 +28,7 @@ You need Windows, eXtreme Gammon 2.10 and git. PowerShell comes with Windows.
 1. Clone the repo somewhere on your Windows drive, for example:
 
    ```powershell
-   git clone --recurse-submodules https://github.com/Rhodri-Morgan/eXtreme-gammon-autosave.git
+   git clone https://github.com/Rhodri-Morgan/eXtreme-gammon-autosave.git
    cd eXtreme-gammon-autosave
    ```
 
@@ -54,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 
 `match-report.py` prints XG's analysis of every move in a saved match: the win % after the move, how much equity it lost compared with XG's best move, and how lucky the roll was.
 
-It needs Python 3.8 or newer and reads the file with [xgdatatools](https://github.com/oysteijo/xgdatatools) (included as a git submodule; if you cloned without `--recurse-submodules`, run `git submodule update --init`).
+It needs Python 3.8 or newer and nothing else; it's a single file using only the standard library. The file-format details come from Michael Petch's [xgdatatools](https://github.com/oysteijo/xgdatatools).
 
 ```powershell
 python match-report.py "$env:USERPROFILE\Documents\eXtremeGammon\Archive\2026-10-04_1618_vs_XG_Roller+_L.xg"
