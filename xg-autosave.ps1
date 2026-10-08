@@ -3,8 +3,12 @@
 # XG's own File > Save As via window messages, so it works without stealing focus.
 param(
     [string]$XGDir = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'eXtremeGammon'),
-    [string]$Archive = (Join-Path $XGDir 'Archive')
+    [string]$Archive = (Join-Path $XGDir 'Archive'),
+    [string]$Bucket = 'prod-eu-west-1-app-data',
+    [string]$AwsProfile = 'xg-autosave'
 )
+$Region = 'eu-west-1'
+$Prefix = 'backgammon/'
 
 Add-Type @"
 using System; using System.Text; using System.Collections.Generic; using System.Runtime.InteropServices;
@@ -43,7 +47,7 @@ $log = Join-Path $Archive 'autosave.log'
 New-Item -ItemType Directory -Force $Archive | Out-Null
 function Log($m) { $l = "{0:yyyy-MM-dd HH:mm:ss} {1}" -f (Get-Date), $m; Add-Content $log $l; Write-Host $l }
 
-# Windows XG always has open; anything else (Save dialog, end-of-match popup) means "not idle".
+# XG's own windows (TMainX, TApplication, TStartDlg) are always open; any other visible window (Save dialog, end-of-match popup) means "not idle".
 function Get-Extra($xgPid) {
     [XG]::Windows($xgPid).GetEnumerator() | Where-Object { $_.Value -notmatch '^(TMainX|TApplication|TStartDlg)\|' }
 }
@@ -91,12 +95,60 @@ function Save-Match($path) {
     Log "Save not confirmed for $path"
 }
 
-# Every profile's matches.dat, so whichever profile is playing gets picked up.
+# The profile's keys from ~\.aws\credentials, as a hashtable.
+function Get-AwsKey {
+    $section = $null; $key = @{}
+    foreach ($l in Get-Content (Join-Path $env:USERPROFILE '.aws\credentials') -ErrorAction SilentlyContinue) {
+        if ($l -match '^\s*\[(.+)\]') { $section = $Matches[1] }
+        elseif ($section -eq $AwsProfile -and $l -match '^\s*(\w+)\s*=\s*(.+?)\s*$') { $key[$Matches[1]] = $Matches[2] }
+    }
+    $key
+}
+
+function Hex($bytes) { -join ($bytes | ForEach-Object { $_.ToString('x2') }) }
+function Sha256($bytes) { Hex ([Security.Cryptography.SHA256]::Create().ComputeHash([byte[]]$bytes)) }
+function Hmac($k, $msg) { [Security.Cryptography.HMACSHA256]::new([byte[]]$k).ComputeHash([Text.Encoding]::UTF8.GetBytes($msg)) }
+
+# SigV4 header-based signing: https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
+function Send-S3($file, $key) {
+    $body = [IO.File]::ReadAllBytes($file)
+    $hash = Sha256 $body
+    $now = (Get-Date).ToUniversalTime()
+    $amzDate = $now.ToString("yyyyMMdd'T'HHmmss'Z'"); $day = $now.ToString('yyyyMMdd')
+    $hostName = "$Bucket.s3.$Region.amazonaws.com"
+    $path = '/' + $Prefix + [Uri]::EscapeDataString((Split-Path $file -Leaf))
+    $signed = 'host;x-amz-content-sha256;x-amz-date'
+    $request = "PUT`n$path`n`nhost:$hostName`nx-amz-content-sha256:$hash`nx-amz-date:$amzDate`n`n$signed`n$hash"
+    $scope = "$day/$Region/s3/aws4_request"
+    $toSign = "AWS4-HMAC-SHA256`n$amzDate`n$scope`n" + (Sha256 ([Text.Encoding]::UTF8.GetBytes($request)))
+    $k = [Text.Encoding]::UTF8.GetBytes('AWS4' + $key.aws_secret_access_key)
+    foreach ($part in $day, $Region, 's3', 'aws4_request') { $k = Hmac $k $part }
+    $auth = "AWS4-HMAC-SHA256 Credential=$($key.aws_access_key_id)/$scope, SignedHeaders=$signed, Signature=$(Hex (Hmac $k $toSign))"
+    [void](Invoke-WebRequest -UseBasicParsing -Method Put -Uri "https://$hostName$path" -Body $body -ContentType 'application/octet-stream' `
+        -Headers @{ 'x-amz-date' = $amzDate; 'x-amz-content-sha256' = $hash; Authorization = $auth })
+}
+
+$uploaded = Join-Path $Archive 's3-uploaded.txt'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+# Upload every .xg not yet in s3-uploaded.txt, so a failed upload is retried after the next match.
+# Optional: without an [xg-autosave] key, nothing is uploaded.
+function Sync-Archive {
+    $key = Get-AwsKey
+    if (-not $key.aws_secret_access_key) { return }
+    $done = @(Get-Content $uploaded -ErrorAction SilentlyContinue)
+    foreach ($f in Get-ChildItem $Archive -Filter *.xg | Where-Object { $done -notcontains $_.Name }) {
+        try { Send-S3 $f.FullName $key; Add-Content $uploaded $f.Name; Log "Uploaded $($f.Name) to s3://$Bucket/$Prefix" }
+        catch { Log "S3 upload failed for $($f.Name): $_" }
+    }
+}
+
 function Get-MatchLines($file) { @(Get-Content $file -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ }) }
 $counts = @{}
+# Every profile's matches.dat, so whichever profile is playing gets picked up.
 Get-ChildItem (Join-Path $XGDir 'Profiles') -Filter matches.dat -Recurse | ForEach-Object { $counts[$_.FullName] = (Get-MatchLines $_.FullName).Count }
 if (-not $counts.Count) { Log "No profiles found under $XGDir\Profiles"; exit 1 }
 Log "Watching $($counts.Keys -join ', ')"
+Sync-Archive
 
 while ($true) {
     Start-Sleep 3
@@ -113,5 +165,6 @@ while ($true) {
         $name = '{0:yyyy-MM-dd_HHmm}_vs_{1}_{2}.xg' -f $start, $opp, $result
         Start-Sleep 3   # let XG finish its own end-of-match bookkeeping
         Save-Match (Join-Path $Archive $name)
+        Sync-Archive
     }
 }
