@@ -25,6 +25,8 @@ Every save, and every save it skips, is logged in `Archive\autosave.log`.
 
 You need Windows, eXtreme Gammon 2.10 and git. PowerShell comes with Windows.
 
+For the optional [S3 upload](#s3-upload) you also need an upload key.
+
 1. Clone the repo somewhere on your Windows drive, for example:
 
    ```powershell
@@ -49,6 +51,20 @@ To stop it and remove it from startup:
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall
 ```
+
+## S3 upload
+
+This is optional and off until you add an upload key. After each match, and when the script starts, any `.xg` file in the archive that hasn't been uploaded yet is uploaded to `s3://prod-eu-west-1-app-data/backgammon/`. Uploaded files are listed in `Archive\s3-uploaded.txt`, so a failed upload is retried next time. The script signs the requests itself, so the AWS CLI isn't needed.
+
+The upload key is the `prod-eu-west-1-xg-autosave` IAM user, managed in the [terraform repo](https://github.com/Rhodri-Morgan/terraform/blob/master/applications/iam.tf). It can only upload under `backgammon/`. Copy its key from the `prod-eu-west-1-xg-autosave-credentials` secret in AWS Secrets Manager into `%USERPROFILE%\.aws\credentials` on Windows:
+
+```ini
+[xg-autosave]
+aws_access_key_id = AKIA...
+aws_secret_access_key = ...
+```
+
+To turn uploads off, remove the `[xg-autosave]` section.
 
 ## Match report
 
