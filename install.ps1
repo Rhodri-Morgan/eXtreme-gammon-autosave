@@ -1,10 +1,12 @@
 # Starts xg-autosave.ps1 now and at every Windows sign-in (via a Startup folder shortcut).
 # Run again with -Uninstall to stop it and remove the shortcut.
-param([switch]$Uninstall)
+# -UserId is your rhodrimorgan.dev account id; it turns on S3 uploads to backgammon/<UserId>/ (see README).
+param([switch]$Uninstall, [string]$UserId = '')
 
 $script = Join-Path $PSScriptRoot 'xg-autosave.ps1'
 $link = Join-Path ([Environment]::GetFolderPath('Startup')) 'XG AutoSave.lnk'
 $arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$script`""
+if ($UserId) { $arguments += " -UserId $UserId" }
 
 # Stop any copy already running, so reinstalling never leaves two watchers.
 Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" |

@@ -5,10 +5,12 @@ param(
     [string]$XGDir = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'eXtremeGammon'),
     [string]$Archive = (Join-Path $XGDir 'Archive'),
     [string]$Bucket = 'prod-eu-west-1-app-data',
-    [string]$AwsProfile = 'xg-autosave'
+    [string]$AwsProfile = 'xg-autosave',
+    # Your rhodrimorgan.dev account id (Cognito sub): uploads go to backgammon/<UserId>/. Without it nothing is uploaded.
+    [string]$UserId = ''
 )
 $Region = 'eu-west-1'
-$Prefix = 'backgammon/'
+$Prefix = "backgammon/$UserId/"
 
 Add-Type @"
 using System; using System.Text; using System.Collections.Generic; using System.Runtime.InteropServices;
@@ -52,22 +54,32 @@ function Get-Extra($xgPid) {
     [XG]::Windows($xgPid).GetEnumerator() | Where-Object { $_.Value -notmatch '^(TMainX|TApplication|TStartDlg)\|' }
 }
 
+# Open File > Save As and return the dialog's handle, or nothing if it doesn't appear within 10 seconds.
+function Open-SaveAs($xg) {
+    [void][XG]::PostMessage($xg.MainWindowHandle, 0x111, [IntPtr]$CMD_SAVE_AS, [IntPtr]0)
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 250
+        $dlg = (Get-Extra $xg.Id | Where-Object { $_.Value -eq '#32770|Save as' } | Select-Object -First 1).Key
+        if ($dlg) { return $dlg }
+    }
+}
+
 function Save-Match($path) {
     $xg = Get-Process eXtremeGammon2 -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $xg) { Log "XG not running, skipped $path"; return }
 
-    # Wait (up to 10 min) for the user to dismiss any XG dialog before driving the menu.
-    $deadline = (Get-Date).AddMinutes(10)
-    while (Get-Extra $xg.Id) {
-        if ((Get-Date) -gt $deadline) { Log "XG busy with a dialog for 10 min, skipped $path"; return }
-        Start-Sleep 2
-    }
-
-    [void][XG]::PostMessage($xg.MainWindowHandle, 0x111, [IntPtr]$CMD_SAVE_AS, [IntPtr]0)
-    $dlg = $null
-    for ($i = 0; $i -lt 40 -and -not $dlg; $i++) {
-        Start-Sleep -Milliseconds 250
-        $dlg = (Get-Extra $xg.Id | Where-Object { $_.Value -eq '#32770|Save as' } | Select-Object -First 1).Key
+    # Save at once, even with the end-of-match popup open: closing it can start the next match, and a save after that
+    # holds the new match's first moves instead of the one that just ended.
+    $dlg = Open-SaveAs $xg
+    if (-not $dlg) {
+        # XG wouldn't open Save As over whatever is showing: wait (up to 10 min) for the user to close it, then retry.
+        Log "Save As blocked by an XG dialog; waiting for it to close (the save may then hold the next match)"
+        $deadline = (Get-Date).AddMinutes(10)
+        while (Get-Extra $xg.Id) {
+            if ((Get-Date) -gt $deadline) { Log "XG busy with a dialog for 10 min, skipped $path"; return }
+            Start-Sleep 2
+        }
+        $dlg = Open-SaveAs $xg
     }
     if (-not $dlg) { Log "Save As dialog never appeared, skipped $path"; return }
 
@@ -110,13 +122,15 @@ function Sha256($bytes) { Hex ([Security.Cryptography.SHA256]::Create().ComputeH
 function Hmac($k, $msg) { [Security.Cryptography.HMACSHA256]::new([byte[]]$k).ComputeHash([Text.Encoding]::UTF8.GetBytes($msg)) }
 
 # SigV4 header-based signing: https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
-function Send-S3($file, $key) {
-    $body = [IO.File]::ReadAllBytes($file)
+function Send-S3($file, $key, $objectKey) {
+    # Read even while XG holds the file open for writing (its profile files).
+    $stream = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite')
+    try { $body = New-Object byte[] $stream.Length; [void]$stream.Read($body, 0, $body.Length) } finally { $stream.Dispose() }
     $hash = Sha256 $body
     $now = (Get-Date).ToUniversalTime()
     $amzDate = $now.ToString("yyyyMMdd'T'HHmmss'Z'"); $day = $now.ToString('yyyyMMdd')
     $hostName = "$Bucket.s3.$Region.amazonaws.com"
-    $path = '/' + $Prefix + [Uri]::EscapeDataString((Split-Path $file -Leaf))
+    $path = '/' + (($objectKey -split '/' | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/')
     $signed = 'host;x-amz-content-sha256;x-amz-date'
     $request = "PUT`n$path`n`nhost:$hostName`nx-amz-content-sha256:$hash`nx-amz-date:$amzDate`n`n$signed`n$hash"
     $scope = "$day/$Region/s3/aws4_request"
@@ -130,16 +144,23 @@ function Send-S3($file, $key) {
 
 $uploaded = Join-Path $Archive 's3-uploaded.txt'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-# Upload every .xg not yet in s3-uploaded.txt, so a failed upload is retried after the next match.
-# Optional: without an [xg-autosave] key, nothing is uploaded.
-function Sync-Archive {
+# Upload every .xg not yet in s3-uploaded.txt, so a failed upload is retried after the next match, then the profile
+# the match was played in (all of it, overwriting the last copy: XG keeps adding to it).
+# Optional: without an [xg-autosave] key and a -UserId, nothing is uploaded.
+function Sync-Archive($profileDir) {
     $key = Get-AwsKey
-    if (-not $key.aws_secret_access_key) { return }
+    if (-not $key.aws_secret_access_key -or -not $UserId) { return }
     $done = @(Get-Content $uploaded -ErrorAction SilentlyContinue)
     foreach ($f in Get-ChildItem $Archive -Filter *.xg | Where-Object { $done -notcontains $_.Name }) {
-        try { Send-S3 $f.FullName $key; Add-Content $uploaded $f.Name; Log "Uploaded $($f.Name) to s3://$Bucket/$Prefix" }
+        try { Send-S3 $f.FullName $key ($Prefix + $f.Name); Add-Content $uploaded $f.Name; Log "Uploaded $($f.Name) to s3://$Bucket/$Prefix" }
         catch { Log "S3 upload failed for $($f.Name): $_" }
     }
+    # ponytail: one profile per player; a second XG profile would overwrite the first's copy.
+    foreach ($f in Get-ChildItem $profileDir -File) {
+        try { Send-S3 $f.FullName $key ($Prefix + 'profile/' + $f.Name) }
+        catch { Log "S3 upload failed for profile file $($f.Name): $_" }
+    }
+    Log "Uploaded profile $(Split-Path $profileDir -Leaf) to s3://$Bucket/${Prefix}profile/"
 }
 
 function Get-MatchLines($file) { @(Get-Content $file -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ }) }
@@ -148,7 +169,8 @@ $counts = @{}
 Get-ChildItem (Join-Path $XGDir 'Profiles') -Filter matches.dat -Recurse | ForEach-Object { $counts[$_.FullName] = (Get-MatchLines $_.FullName).Count }
 if (-not $counts.Count) { Log "No profiles found under $XGDir\Profiles"; exit 1 }
 Log "Watching $($counts.Keys -join ', ')"
-Sync-Archive
+if (-not $UserId) { Log "No -UserId, so nothing is uploaded to S3" }
+foreach ($file in @($counts.Keys)) { Sync-Archive (Split-Path $file) }
 
 while ($true) {
     Start-Sleep 3
@@ -163,8 +185,8 @@ while ($true) {
         $result = if ([int]$f[6] -gt [int]$f[7]) { 'W' } else { 'L' }
         $opp = ($f[1] -replace '[\\/:*?"<>|]', '_') -replace ' ', '_'
         $name = '{0:yyyy-MM-dd_HHmm}_vs_{1}_{2}.xg' -f $start, $opp, $result
-        Start-Sleep 3   # let XG finish its own end-of-match bookkeeping
+        Start-Sleep 1   # let XG finish its own end-of-match bookkeeping
         Save-Match (Join-Path $Archive $name)
-        Sync-Archive
+        Sync-Archive (Split-Path $file)
     }
 }
