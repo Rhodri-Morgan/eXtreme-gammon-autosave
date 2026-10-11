@@ -186,8 +186,12 @@ if ((Get-XGSetting Settings AddResults) -ne 1) { Log "XG doesn't add games to th
 if (-not $Key) { Log "No -Key, so nothing is uploaded" }
 foreach ($file in @($counts.Keys)) { Sync-Archive (Split-Path $file) }
 
+# Wake when XG writes a matches.dat, so a match is saved before the next one starts; else check every 60 seconds anyway.
+$watcher = New-Object IO.FileSystemWatcher $Profiles, 'matches.dat'
+$watcher.IncludeSubdirectories = $true
+$watcher.EnableRaisingEvents = $true   # without it, the wait below never sees a change
 while ($true) {
-    Start-Sleep 3
+    [void]$watcher.WaitForChanged([IO.WatcherChangeTypes]::All, 60000)
     foreach ($file in @($counts.Keys)) {
         $lines = Get-MatchLines $file
         if ($lines.Count -le $counts[$file]) { if ($lines.Count) { $counts[$file] = $lines.Count }; continue }
