@@ -4,11 +4,19 @@
 param(
     [string]$XGDir = (Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'eXtremeGammon'),
     [string]$Archive = (Join-Path $XGDir 'Archive'),
-    [string]$Bucket = 'prod-eu-west-1-app-data',
-    [string]$AwsProfile = 'xg-autosave'
+    # Your XG AutoSave key, from Backgammon > Install on the site. Uploads go to your own games only.
+    [string]$Key = '',
+    [string]$Api = 'https://rhodrimorgan.dev/api'
 )
-$Region = 'eu-west-1'
-$Prefix = 'backgammon/'
+
+# Read-only: XG's registry settings are sent to the site, never written back.
+function Get-XGSetting($key, $name) {
+    (Get-ItemProperty "HKCU:\Software\GameSite 2000\eXtreme Gammon 2\$key" -Name $name -ErrorAction SilentlyContinue).$name
+}
+# Where XG keeps its profiles (Options > Path), and the profile of the human playing.
+$Profiles = Get-XGSetting Paths Data
+if (-not $Profiles -or -not (Test-Path $Profiles)) { $Profiles = Join-Path $XGDir 'Profiles' }
+$ProfileName = Get-XGSetting Default User
 
 Add-Type @"
 using System; using System.Text; using System.Collections.Generic; using System.Runtime.InteropServices;
@@ -52,22 +60,33 @@ function Get-Extra($xgPid) {
     [XG]::Windows($xgPid).GetEnumerator() | Where-Object { $_.Value -notmatch '^(TMainX|TApplication|TStartDlg)\|' }
 }
 
+# Open File > Save As and return the dialog's handle, or nothing if it doesn't appear within 10 seconds.
+function Open-SaveAs($xg) {
+    [void][XG]::PostMessage($xg.MainWindowHandle, 0x111, [IntPtr]$CMD_SAVE_AS, [IntPtr]0)
+    for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Milliseconds 250
+        # Found by its file name box, not its title, which is in XG's language.
+        $dlg = (Get-Extra $xg.Id | Where-Object { $_.Value -like '#32770|*' -and [XG]::FileNameEdit($_.Key) -ne [IntPtr]::Zero } | Select-Object -First 1).Key
+        if ($dlg) { return $dlg }
+    }
+}
+
 function Save-Match($path) {
     $xg = Get-Process eXtremeGammon2 -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $xg) { Log "XG not running, skipped $path"; return }
 
-    # Wait (up to 10 min) for the user to dismiss any XG dialog before driving the menu.
-    $deadline = (Get-Date).AddMinutes(10)
-    while (Get-Extra $xg.Id) {
-        if ((Get-Date) -gt $deadline) { Log "XG busy with a dialog for 10 min, skipped $path"; return }
-        Start-Sleep 2
-    }
-
-    [void][XG]::PostMessage($xg.MainWindowHandle, 0x111, [IntPtr]$CMD_SAVE_AS, [IntPtr]0)
-    $dlg = $null
-    for ($i = 0; $i -lt 40 -and -not $dlg; $i++) {
-        Start-Sleep -Milliseconds 250
-        $dlg = (Get-Extra $xg.Id | Where-Object { $_.Value -eq '#32770|Save as' } | Select-Object -First 1).Key
+    # Save at once, even with the end-of-match popup open: closing it can start the next match, and a save after that
+    # holds the new match's first moves instead of the one that just ended.
+    $dlg = Open-SaveAs $xg
+    if (-not $dlg) {
+        # XG won't open Save As over whatever is showing: wait for the user to close it, then retry.
+        Log "Save As blocked by an XG dialog; waiting for it to close (the save may then hold the next match)"
+        $deadline = (Get-Date).AddMinutes(10)
+        while (Get-Extra $xg.Id) {
+            if ((Get-Date) -gt $deadline) { Log "XG busy with a dialog for 10 min, skipped $path"; return }
+            Start-Sleep 2
+        }
+        $dlg = Open-SaveAs $xg
     }
     if (-not $dlg) { Log "Save As dialog never appeared, skipped $path"; return }
 
@@ -83,7 +102,8 @@ function Save-Match($path) {
 
     for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Milliseconds 500
-        $confirm = (Get-Extra $xg.Id | Where-Object { $_.Value -eq '#32770|Confirm Save As' } | Select-Object -First 1).Key
+        # Any other dialog now is Windows asking to replace the file.
+        $confirm = (Get-Extra $xg.Id | Where-Object { $_.Value -like '#32770|*' -and $_.Key -ne $dlg } | Select-Object -First 1).Key
         if ($confirm) {
             # Never overwrite: answer No, then cancel the save dialog.
             [void][XG]::PostMessage($confirm, 0x466, [IntPtr]7, [IntPtr]0); Start-Sleep 1
@@ -95,60 +115,76 @@ function Save-Match($path) {
     Log "Save not confirmed for $path"
 }
 
-# The profile's keys from ~\.aws\credentials, as a hashtable.
-function Get-AwsKey {
-    $section = $null; $key = @{}
-    foreach ($l in Get-Content (Join-Path $env:USERPROFILE '.aws\credentials') -ErrorAction SilentlyContinue) {
-        if ($l -match '^\s*\[(.+)\]') { $section = $Matches[1] }
-        elseif ($section -eq $AwsProfile -and $l -match '^\s*(\w+)\s*=\s*(.+?)\s*$') { $key[$Matches[1]] = $Matches[2] }
+# Upload a file to the site as `name` in the player's folder. Read even while XG holds it open (its profile files).
+# A match already there (409) counts as uploaded.
+function Send-File($file, $name) {
+    $stream = [IO.File]::Open($file, 'Open', 'Read', 'ReadWrite')
+    try { $body = New-Object byte[] $stream.Length; [void]$stream.Read($body, 0, $body.Length) } finally { $stream.Dispose() }
+    $path = ($name -split '/' | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
+    try {
+        [void](Invoke-WebRequest -UseBasicParsing -Method Put -Uri "$Api/backgammon/files/$path" -Body $body -ContentType 'application/octet-stream' `
+            -Headers @{ Authorization = "Bearer $Key" })
+    } catch {
+        $status = [int]$_.Exception.Response.StatusCode
+        if ($status -eq 409) { return }
+        if ($status -eq 401) { throw "the key no longer works: make a new one at Backgammon > Install on the site" }
+        throw
     }
-    $key
-}
-
-function Hex($bytes) { -join ($bytes | ForEach-Object { $_.ToString('x2') }) }
-function Sha256($bytes) { Hex ([Security.Cryptography.SHA256]::Create().ComputeHash([byte[]]$bytes)) }
-function Hmac($k, $msg) { [Security.Cryptography.HMACSHA256]::new([byte[]]$k).ComputeHash([Text.Encoding]::UTF8.GetBytes($msg)) }
-
-# SigV4 header-based signing: https://docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html
-function Send-S3($file, $key) {
-    $body = [IO.File]::ReadAllBytes($file)
-    $hash = Sha256 $body
-    $now = (Get-Date).ToUniversalTime()
-    $amzDate = $now.ToString("yyyyMMdd'T'HHmmss'Z'"); $day = $now.ToString('yyyyMMdd')
-    $hostName = "$Bucket.s3.$Region.amazonaws.com"
-    $path = '/' + $Prefix + [Uri]::EscapeDataString((Split-Path $file -Leaf))
-    $signed = 'host;x-amz-content-sha256;x-amz-date'
-    $request = "PUT`n$path`n`nhost:$hostName`nx-amz-content-sha256:$hash`nx-amz-date:$amzDate`n`n$signed`n$hash"
-    $scope = "$day/$Region/s3/aws4_request"
-    $toSign = "AWS4-HMAC-SHA256`n$amzDate`n$scope`n" + (Sha256 ([Text.Encoding]::UTF8.GetBytes($request)))
-    $k = [Text.Encoding]::UTF8.GetBytes('AWS4' + $key.aws_secret_access_key)
-    foreach ($part in $day, $Region, 's3', 'aws4_request') { $k = Hmac $k $part }
-    $auth = "AWS4-HMAC-SHA256 Credential=$($key.aws_access_key_id)/$scope, SignedHeaders=$signed, Signature=$(Hex (Hmac $k $toSign))"
-    [void](Invoke-WebRequest -UseBasicParsing -Method Put -Uri "https://$hostName$path" -Body $body -ContentType 'application/octet-stream' `
-        -Headers @{ 'x-amz-date' = $amzDate; 'x-amz-content-sha256' = $hash; Authorization = $auth })
 }
 
 $uploaded = Join-Path $Archive 's3-uploaded.txt'
+$settingsFile = Join-Path $Archive 'xg-settings.json'
+
+# The XG settings the site needs to read the files right, as JSON in Archive\.
+function Write-XGSettings {
+    $settings = [ordered]@{
+        xgVersion        = Get-XGSetting Settings LastRunVersion
+        language         = Get-XGSetting Settings Language
+        profile          = $ProfileName
+        profiles         = $Profiles
+        player1          = [ordered]@{ name = Get-XGSetting Default P1Name; computer = (Get-XGSetting Default P1Comp) -eq 1; computerName = Get-XGSetting Default Comp1Name }
+        player2          = [ordered]@{ name = Get-XGSetting Default P2Name; computer = (Get-XGSetting Default P2Comp) -eq 1; computerName = Get-XGSetting Default Comp2Name }
+        addResults       = (Get-XGSetting Settings AddResults) -eq 1
+        analysisLevel    = Get-XGSetting Analzye WithProfile
+        tutor            = (Get-XGSetting Settings Tutor) -eq 1
+        decimalSeparator = [Globalization.CultureInfo]::CurrentCulture.NumberFormat.NumberDecimalSeparator
+        timeZone         = [TimeZoneInfo]::Local.Id
+    }
+    [IO.File]::WriteAllText($settingsFile, ($settings | ConvertTo-Json))
+}
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-# Upload every .xg not yet in s3-uploaded.txt, so a failed upload is retried after the next match.
-# Optional: without an [xg-autosave] key, nothing is uploaded.
-function Sync-Archive {
-    $key = Get-AwsKey
-    if (-not $key.aws_secret_access_key) { return }
+# Uploads new .xg files (a failure is retried after the next match), then the whole profile folder, replacing
+# the last copy because XG keeps appending to it, then XG's settings.
+function Sync-Archive($profileDir) {
+    if (-not $Key) { return }
     $done = @(Get-Content $uploaded -ErrorAction SilentlyContinue)
     foreach ($f in Get-ChildItem $Archive -Filter *.xg | Where-Object { $done -notcontains $_.Name }) {
-        try { Send-S3 $f.FullName $key; Add-Content $uploaded $f.Name; Log "Uploaded $($f.Name) to s3://$Bucket/$Prefix" }
-        catch { Log "S3 upload failed for $($f.Name): $_" }
+        try { Send-File $f.FullName $f.Name; Add-Content $uploaded $f.Name; Log "Uploaded $($f.Name)" }
+        catch { Log "Upload failed for $($f.Name): $_" }
     }
+    # ponytail: one profile per player; a second XG profile would replace the first's copy.
+    foreach ($f in Get-ChildItem $profileDir -File) {
+        try { Send-File $f.FullName "profile/$($f.Name)" }
+        catch { Log "Upload failed for profile file $($f.Name): $_" }
+    }
+    Log "Uploaded profile $(Split-Path $profileDir -Leaf)"
+    try { Write-XGSettings; Send-File $settingsFile 'xg-settings.json' }
+    catch { Log "Upload failed for xg-settings.json: $_" }
 }
 
 function Get-MatchLines($file) { @(Get-Content $file -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ }) }
 $counts = @{}
-# Every profile's matches.dat, so whichever profile is playing gets picked up.
-Get-ChildItem (Join-Path $XGDir 'Profiles') -Filter matches.dat -Recurse | ForEach-Object { $counts[$_.FullName] = (Get-MatchLines $_.FullName).Count }
-if (-not $counts.Count) { Log "No profiles found under $XGDir\Profiles"; exit 1 }
+# The human's profile, or every profile if XG doesn't say which is theirs.
+$own = if ($ProfileName) { Join-Path $Profiles "$ProfileName\matches.dat" }
+$watch = if ($own -and (Test-Path $own)) { Get-Item $own } else { Get-ChildItem $Profiles -Filter matches.dat -Recurse }
+$watch | ForEach-Object { $counts[$_.FullName] = (Get-MatchLines $_.FullName).Count }
+if (-not $counts.Count) { Log "No profiles found under $Profiles"; exit 1 }
 Log "Watching $($counts.Keys -join ', ')"
-Sync-Archive
+# Settings that leave the site without games: warned about, not changed.
+if ((Get-XGSetting Settings LastRunVersion) -ne '2.10') { Log "XG is version $(Get-XGSetting Settings LastRunVersion), not 2.10: File > Save As may not open" }
+if ((Get-XGSetting Settings AddResults) -ne 1) { Log "XG doesn't add games to the profile automatically (Player > Add Analyze to Profile (auto)), so finished matches may not be seen" }
+if (-not $Key) { Log "No -Key, so nothing is uploaded" }
+foreach ($file in @($counts.Keys)) { Sync-Archive (Split-Path $file) }
 
 while ($true) {
     Start-Sleep 3
@@ -159,12 +195,13 @@ while ($true) {
 
         # matches.dat line: <start as Delphi date>|<opponent>|<elo before>|<n>|<opp elo>|400|<my pts>|<opp pts>|...
         $f = $lines[-1].Split('|')
-        $start = [DateTime]::FromOADate([double]::Parse($f[0], [Globalization.CultureInfo]::InvariantCulture))
+        # Written in Windows' number format, so the decimal point can be a comma.
+        $start = [DateTime]::FromOADate([double]::Parse($f[0].Replace(',', '.'), [Globalization.CultureInfo]::InvariantCulture))
         $result = if ([int]$f[6] -gt [int]$f[7]) { 'W' } else { 'L' }
         $opp = ($f[1] -replace '[\\/:*?"<>|]', '_') -replace ' ', '_'
         $name = '{0:yyyy-MM-dd_HHmm}_vs_{1}_{2}.xg' -f $start, $opp, $result
-        Start-Sleep 3   # let XG finish its own end-of-match bookkeeping
+        Start-Sleep 1   # let XG finish its own end-of-match bookkeeping
         Save-Match (Join-Path $Archive $name)
-        Sync-Archive
+        Sync-Archive (Split-Path $file)
     }
 }
